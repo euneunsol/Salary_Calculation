@@ -1,0 +1,111 @@
+erDiagram
+    AUTH_USERS ||--|| PROFILES : "1:1 (id)"
+
+    PROFILES {
+        uuid id PK "auth.users.id"
+        text name
+        text email UK
+        text phone
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    PROFILES ||--o{ STORES : "owner_id (사장님)"
+
+    STORES {
+        uuid id PK
+        text name
+        uuid owner_id FK
+        text address
+        smallint week_start_day "1=월요일"
+        text join_code UK "매장 참여코드"
+        boolean is_active
+        timestamptz created_at
+    }
+
+    STORES ||--o{ STORE_MEMBERS : "매장 소속"
+    PROFILES ||--o{ STORE_MEMBERS : "사용자 소속"
+
+    STORE_MEMBERS {
+        uuid id PK
+        uuid store_id FK
+        uuid user_id FK
+        enum role "MANAGER|EMPLOYEE"
+        enum status "ACTIVE|INACTIVE"
+        date joined_at
+        date left_at
+        timestamptz created_at
+    }
+
+    STORE_MEMBERS ||--o{ WAGE_HISTORY : "시급 이력"
+    STORE_MEMBERS ||--o{ WORK_RECORDS : "일별 근무"
+    STORE_MEMBERS ||--o{ WEEKLY_SUMMARIES : "주간 집계"
+    STORE_MEMBERS ||--o{ PAYROLLS : "월별 급여"
+
+    WAGE_HISTORY {
+        uuid id PK
+        uuid store_member_id FK
+        integer hourly_wage "원 단위"
+        date effective_from
+        date effective_to "NULL=현재"
+        text memo
+        uuid created_by FK
+        timestamptz created_at
+    }
+
+    WORK_RECORDS {
+        uuid id PK
+        uuid store_member_id FK
+        date work_date UK "member+date 유니크"
+        time start_time
+        time end_time
+        boolean crosses_midnight
+        integer break_minutes
+        integer work_minutes "트리거 계산"
+        enum status "DRAFT|SUBMITTED|APPROVED|REJECTED"
+        text memo
+        text reject_reason
+        timestamptz submitted_at
+        uuid approved_by FK
+        timestamptz approved_at
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    WEEKLY_SUMMARIES {
+        uuid id PK
+        uuid store_member_id FK
+        date week_start UK "member+week_start 유니크"
+        date week_end
+        integer work_minutes
+        boolean is_eligible "주 900분 이상"
+        integer allowance_minutes "주휴 환산, 최대 480"
+        timestamptz calculated_at
+    }
+
+    PAYROLLS {
+        uuid id PK
+        uuid store_member_id FK
+        integer year UK "member+year+month 유니크"
+        integer month
+        integer work_minutes
+        integer allowance_minutes
+        integer base_pay
+        integer allowance_pay
+        integer total_pay
+        jsonb wage_breakdown "시급 구간별 내역"
+        enum status "CALCULATED|CONFIRMED|PAID"
+        timestamptz calculated_at
+        uuid confirmed_by FK
+        timestamptz confirmed_at
+    }
+
+    HOLIDAYS {
+        uuid id PK
+        date holiday_date UK
+        text name
+        enum type "PUBLIC|SUBSTITUTE|TEMPORARY"
+        boolean is_public_holiday
+        text source
+        timestamptz synced_at
+    }
