@@ -29,9 +29,7 @@ npm install
 ### 2. Supabase 프로젝트 준비
 
 1. https://supabase.com 에서 새 프로젝트를 만든다.
-2. Dashboard → **SQL Editor** 에서 다음 순서로 실행한다.
-   - `supabase/migrations/0001_init.sql`
-   - `supabase/migrations/0002_rls.sql`
+2. Dashboard → **SQL Editor** 에서 `supabase/migrations/0001_init.sql`부터 번호 순서대로 최신 마이그레이션까지 실행한다.
 3. Dashboard → **Settings → API** 에서 Project URL 과 `anon` public key 를 복사한다.
 
 ### 3. 환경변수
@@ -56,6 +54,16 @@ npm run typecheck  # 타입 검사
 npm run build      # 프로덕션 빌드
 ```
 
+### 5. Cloudflare Pages 배포
+
+1. GitHub 저장소를 Cloudflare Pages에 연결한다.
+2. Framework preset은 `Vite`, Root directory는 `web`으로 설정한다.
+3. Build command는 `npm run build`, Build output directory는 `dist`로 설정한다.
+4. Environment variables에 `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`를 등록한다.
+5. Supabase Dashboard의 Authentication → URL Configuration에서 Site URL을 배포 주소로 변경하고 Redirect URLs에 `https://배포주소/**`를 추가한다.
+
+`web/public/_redirects`가 React Router 경로를 `index.html`로 연결하므로 새로고침 시 404가 발생하지 않는다.
+
 ## 지금까지 된 것
 
 - [x] 설계 문서 · ERD
@@ -69,16 +77,16 @@ npm run build      # 프로덕션 빌드
 
 설계문서 §9 개발 순서 기준.
 
-- [ ] 3~4단계 — Supabase 프로젝트에 마이그레이션 적용 후 RLS 검증 5종 직접 실행
-- [ ] 6단계 — 사장님: 매장 생성·목록
-- [ ] 7단계 — 참여 코드로 직원 등록
-- [ ] 8단계 — 시급 설정 (`set_wage()` 사용)
-- [ ] 9단계 — 공휴일 Edge Function
-- [ ] 10~11단계 — 근무 달력, 근무기록 입력
-- [ ] 12단계 — 근무 승인/반려
-- [ ] 13단계 — 급여 계산 Edge Function (`web/src/features/payroll/payrollCalc.ts` 로직 이식)
-- [ ] 14~15단계 — 급여 화면, 대시보드
-- [ ] 16단계 — Cloudflare Pages 배포
+- [x] 6단계 — 사장님: 매장 생성·목록
+- [x] 7단계 — 참여 코드로 직원 등록
+- [x] 8단계 — 시급 설정 (`set_wage()` 사용)
+- [x] 9단계 — 공휴일 데이터 저장·달력 표시
+- [x] 10~11단계 — 근무 달력, 근무기록 입력
+- [x] 12단계 — 근무 승인/반려
+- [x] 13단계 — 급여 계산 RPC + 계산 규칙 테스트
+- [x] 14~15단계 — 급여 화면, 역할별 대시보드, 확정·지급 처리
+- [x] 16단계 — Cloudflare Pages 배포 설정
+- [ ] 운영 전 — 전체 마이그레이션 적용 및 역할별 RLS 시나리오 직접 검증
 
 ## 급여 계산 규칙 요약
 
