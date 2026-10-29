@@ -7,3 +7,11 @@ dist/
 .vscode/
 .idea/
 supabase/.temp/
+
+# 로컬 에이전트/AI 도구 파일 (저장소에 포함하지 않음)
+.claude/
+.impeccable/
+web/.claude/
+web/.codex/
+web/.agents/
+web/skills-lock.json
