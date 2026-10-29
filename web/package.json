@@ -8,8 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test \"src/**/*.test.ts\"",
-    "test:watch": "tsx --test --watch \"src/**/*.test.ts\""
+    "test": "tsx --test src/features/auth/password.test.ts src/features/stores/storeForm.test.ts src/features/wages/minimumWage.test.ts src/features/workRecords/workRecordForm.test.ts src/features/workRecords/workRecordStatus.test.ts src/features/auth/authError.test.ts src/features/payroll/payrollCalc.test.ts",
+    "test:watch": "tsx --test --watch src/features/auth/password.test.ts src/features/stores/storeForm.test.ts src/features/wages/minimumWage.test.ts src/features/workRecords/workRecordForm.test.ts src/features/workRecords/workRecordStatus.test.ts src/features/auth/authError.test.ts src/features/payroll/payrollCalc.test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

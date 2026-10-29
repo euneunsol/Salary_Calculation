@@ -3,9 +3,14 @@
  *
  * 설계문서 §5 의 규칙을 그대로 구현한다.
  *
- *  규칙 A — 주휴수당은 "주가 끝나는 날짜(weekEnd)가 속한 달"에 귀속시킨다.
+ *  규칙 A — 주휴수당은 달력상 한 주(예: 월~일) 전체의 실근무시간을 기준으로 계산한다.
+ *           주가 두 달에 걸쳐도 시간을 자르지 않는다(예: 7/29~8/4 주는 7월분+8월분을 합산).
+ *           그렇게 계산한 주휴수당은 "그 주가 끝나는 날짜가 속한 달"에만 전액 귀속시킨다 —
+ *           즉 한 주는 정확히 한 달에서만 카운트되고, 두 달에 걸쳐 중복 지급되지 않는다.
+ *           단, 기본급(실 근무시간·시급 구간)은 이 규칙과 무관하게 항상 해당 월 범위로만 계산한다.
  *  규칙 B — 입사 전 / 퇴사 후 날짜는 주 집계에서 제외한다.
  *           즉 주 범위를 [max(weekStart, joinedAt), min(weekEnd, leftAt)] 로 자른 뒤 판정한다.
+ *           (규칙 A의 "끝나는 달" 판정도 이렇게 재직기간으로 자른 뒤의 끝 날짜로 한다.)
  *  규칙 C — 주휴수당에 적용하는 시급은 "그 주의 마지막 근무일 시급"이다.
  *
  *  주휴 환산   W < 15시간(900분)  → 0
@@ -25,7 +30,6 @@ import {
   isWithin,
   maxDate,
   minDate,
-  monthOf,
   startOfMonth,
   weekStartsBetween,
 } from '../../lib/date';
@@ -70,7 +74,8 @@ export interface PayrollInput {
   weekStartDay: number;
   /**
    * APPROVED 상태 근무기록.
-   * 월 경계 주를 계산해야 하므로 대상 월의 앞뒤 7일을 포함해서 넘겨야 한다.
+   * 월 경계에 걸친 주도 전체 주 단위로 계산해야 하므로(규칙 A),
+   * 호출자는 대상 월의 앞뒤로 최대 6일까지의 근무기록도 포함해서 넘겨야 한다.
    */
   records: WorkRecordInput[];
   wages: WagePeriodInput[];
@@ -220,32 +225,28 @@ export function calculatePayroll(input: PayrollInput): PayrollResult {
   const unpricedMinutes = workMinutes - pricedMinutes;
 
   // --- 2) 주간 집계 + 주휴수당 ---------------------------------------------
-  // 월 경계에 걸친 주를 놓치지 않도록 앞뒤 7일 여유를 두고 주를 나열한다.
-  const weekStarts = weekStartsBetween(
-    addDays(monthStart, -7),
-    addDays(monthEnd, 7),
-    weekStartDay,
-  );
+  // 이 달과 겹치는 달력상의 주를 나열한다. 각 주의 실제 계산 범위는 재직기간으로만
+  // 자르고(규칙 B), 월 경계로는 자르지 않는다 — 귀속 판정은 아래 루프에서 한다(규칙 A).
+  const weekStarts = weekStartsBetween(monthStart, monthEnd, weekStartDay);
 
   const weeks: WeekSummary[] = [];
   let allowanceMinutes = 0;
   let allowancePay = 0;
 
   for (const weekStart of weekStarts) {
-    const weekEnd = addDays(weekStart, 6);
-
-    const range = clipToMembership(weekStart, weekEnd, membership); // 규칙 B
+    const calendarWeekEnd = addDays(weekStart, 6);
+    // 규칙 B만 적용한다 — 월 경계로는 자르지 않고, 재직 기간으로만 자른 "전체 주"를 구한다.
+    const range = clipToMembership(weekStart, calendarWeekEnd, membership);
     if (!range) continue;
 
-    // 재직 범위로 자른 뒤에도 대상 월과 전혀 겹치지 않으면 버린다.
-    // (예: 9/1 입사 직원의 8/31~9/6 주 → 실제 재직 범위는 9/1~9/6 이므로 8월과 무관)
-    if (compareDate(range.to, monthStart) < 0) continue;
-    if (compareDate(range.from, monthEnd) > 0) continue;
+    // 규칙 A — 이 주(재직기간으로 자른 뒤)가 끝나는 날짜가 이번 달에 속할 때만
+    // 이번 달 급여로 계산한다. 그렇지 않으면(다음 달에서 끝나면) 그 달의 계산에 맡기고 건너뛴다.
+    if (!isWithin(range.to, monthStart, monthEnd)) continue;
 
     const weekMinutes = sumMinutes(range.from, range.to);
     const allowMin = allowanceMinutesFor(weekMinutes);
 
-    // 규칙 C — 그 주의 마지막 근무일 시급
+    // 규칙 C — 그 주(전체 주) 중 마지막 근무일의 시급
     let lastWorkedDate: string | null = null;
     for (const [date, minutes] of minutesByDate) {
       if (minutes > 0 && isWithin(date, range.from, range.to)) {
@@ -254,22 +255,13 @@ export function calculatePayroll(input: PayrollInput): PayrollResult {
     }
     const appliedWage = lastWorkedDate ? wageAt(wages, lastWorkedDate) : null;
 
-    // 규칙 A — 주 종료일이 속한 달에 귀속.
-    // 단 퇴사자는 재직 범위로 자른 종료일(range.to)을 쓴다.
-    // 7/28 퇴사자의 7/27~8/2 주를 8월에 귀속시키면, 8월 급여가 없는데 주휴수당만 뜨게 된다.
-    const belongs = monthOf(range.to);
-    const counted = belongs.year === year && belongs.month === month;
-
-    const pay = counted && appliedWage !== null ? payFor(allowMin, appliedWage) : 0;
-
-    if (counted) {
-      allowanceMinutes += allowMin;
-      allowancePay += pay;
-    }
+    const pay = appliedWage !== null ? payFor(allowMin, appliedWage) : 0;
+    allowanceMinutes += allowMin;
+    allowancePay += pay;
 
     weeks.push({
       weekStart,
-      weekEnd,
+      weekEnd: calendarWeekEnd,
       rangeFrom: range.from,
       rangeTo: range.to,
       workMinutes: weekMinutes,
@@ -277,9 +269,9 @@ export function calculatePayroll(input: PayrollInput): PayrollResult {
       allowanceMinutes: allowMin,
       appliedWage,
       allowancePay: pay,
-      belongsToYear: belongs.year,
-      belongsToMonth: belongs.month,
-      countedInThisMonth: counted,
+      belongsToYear: year,
+      belongsToMonth: month,
+      countedInThisMonth: true,
     });
   }
 

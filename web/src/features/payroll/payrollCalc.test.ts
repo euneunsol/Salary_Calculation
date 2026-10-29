@@ -23,6 +23,7 @@ import {
 
 import {
   addDays,
+  compareDate,
   endOfMonth,
   endOfWeek,
   isoDayOfWeek,
@@ -111,6 +112,10 @@ describe('주휴 환산 규칙 (§5.2)', () => {
 
   it('주 18시간 → 3.6시간(216분) 환산', () => {
     assert.equal(allowanceMinutesFor(18 * 60), 216);
+  });
+
+  it('주 26.5시간 → 5.3시간(318분) 환산', () => {
+    assert.equal(allowanceMinutesFor(26.5 * 60), 318);
   });
 
   it('주 40시간 → 8시간(480분), 상한과 정확히 일치', () => {
@@ -205,84 +210,104 @@ describe('시급 이력 적용 (§5.4 케이스 4)', () => {
 });
 
 // ===========================================================================
-describe('월 경계 처리 — 규칙 A (§5.3)', () => {
-  it('설계문서 예시: 7/27~7/31 14시간 + 8/1 4시간 → 18시간, 8월 귀속', () => {
-    const result = calculatePayroll(
-      baseInput({
-        records: [
-          // 7/27(월)~7/31(금) 합계 14시간
-          rec('2026-07-27', 3),
-          rec('2026-07-28', 3),
-          rec('2026-07-29', 3),
-          rec('2026-07-30', 3),
-          rec('2026-07-31', 2),
-          // 8/1(토) 4시간
-          rec('2026-08-01', 4),
-        ],
-      }),
-    );
+// 버그 수정: 주휴수당은 월 경계로 시간을 자르지 않고 "전체 달력 주"로 계산하며,
+// 그 주가 끝나는 날짜가 속한 달에만 전액 귀속된다(중복 귀속 없음).
+// 기본급(실 근무시간)은 이 규칙과 무관하게 항상 해당 월 범위로만 계산된다.
+describe('월 경계 처리 — 전체 주 단위로 계산하고 끝나는 달에 귀속', () => {
+  it('케이스 1 — 월 안에 완전히 포함된 주는 이전과 동일하게 계산된다 (회귀 없음)', () => {
+    const result = calculatePayroll(baseInput({ records: recRange('2026-08-10', 5, 4) })); // 8/10~14, 20시간
+    const week = result.weeks.find((w) => w.weekStart === '2026-08-10');
+    assert.ok(week);
+    assert.equal(week.weekEnd, '2026-08-16');
+    assert.equal(week.workMinutes, 20 * 60);
+    assert.equal(week.allowanceMinutes, 240); // 20 ÷ 5 = 4h
+  });
 
-    const week = result.weeks.find((w) => w.weekStart === '2026-07-27');
-    assert.ok(week, '7/27 주가 계산에 포함되어야 한다');
-    assert.equal(week.weekEnd, '2026-08-02');
-    assert.equal(week.workMinutes, 18 * 60); // 전월 14h + 당월 4h
+  it('케이스 2 — 7/29~8/2에 걸친 주 30시간 근무는 8월에 정확히 6시간(360분) 주휴수당으로 계산된다', () => {
+    const records = [
+      ...recRange('2026-07-29', 3, 6), // 7/29~7/31, 3일×6시간 = 18시간 (7월분)
+      ...recRange('2026-08-01', 2, 6), // 8/1~8/2, 2일×6시간 = 12시간 (8월분)
+    ]; // 이 주(7/27~8/2) 총 근무시간 = 30시간
+    const august = calculatePayroll(baseInput({ month: 8, records }));
+    const week = august.weeks.find((w) => w.weekStart === '2026-07-27');
+    assert.ok(week);
+    assert.equal(week.workMinutes, 30 * 60);
     assert.equal(week.isEligible, true);
-    assert.equal(week.allowanceMinutes, 216); // 18 ÷ 5 = 3.6h
-    assert.equal(week.belongsToMonth, 8);
-    assert.equal(week.countedInThisMonth, true);
+    assert.equal(week.allowanceMinutes, 360); // 기존 공식 그대로: 30 ÷ 5 = 6시간
+    assert.equal(august.allowanceMinutes, 360);
 
-    // 기본급은 당월(8/1) 4시간만
-    assert.equal(result.workMinutes, 240);
-    assert.equal(result.basePay, payFor(240, WAGE_2026));
-    // 주휴수당은 18시간 전체 기준
-    assert.equal(result.allowanceMinutes, 216);
+    // 이 주는 8월에 끝나므로 8월에 전액 귀속되고, 7월 계산에는 나타나지 않는다(중복 귀속 없음).
+    const july = calculatePayroll(baseInput({ month: 7, records }));
+    assert.equal(july.weeks.find((w) => w.weekStart === '2026-07-27'), undefined);
+    assert.equal(july.allowanceMinutes, 0);
   });
 
-  it('전월 근무만으로 15시간을 채워도 주 종료일이 8월이면 8월에 귀속된다', () => {
-    const result = calculatePayroll(
-      baseInput({
-        records: recRange('2026-07-27', 5, 4), // 7/27~7/31 20시간, 8월 근무 0
-      }),
-    );
-    assert.equal(result.workMinutes, 0); // 당월 근무 없음
-    assert.equal(result.basePay, 0);
-    assert.equal(result.allowanceMinutes, 240); // 20h ÷ 5 = 4h
-    assert.equal(result.totalPay, payFor(240, WAGE_2026));
+  it('케이스 3 — 경계 주 계산에 쓰인 이전 달 근무시간이 이번 달 기본급에 다시 더해지지 않는다', () => {
+    const records = [
+      ...recRange('2026-07-29', 3, 6), // 7/29~7/31 (18시간) — 8월 주휴 계산의 맥락으로만 쓰여야 함
+      ...recRange('2026-08-01', 2, 6), // 8/1~8/2 (12시간) — 8월 정규 근무
+      ...recRange('2026-08-04', 3, 5), // 8/4~8/6 (15시간) — 8월 정규 근무(별도 주)
+    ];
+    const august = calculatePayroll(baseInput({ month: 8, records }));
+    // 기본급은 8월 날짜(8/1~8/6)만 합산 = 12+15 = 27시간. 7월분 18시간은 포함되지 않는다.
+    assert.equal(august.workMinutes, 27 * 60);
+    assert.equal(august.basePay, payFor(27 * 60, WAGE_2026));
+
+    const july = calculatePayroll(baseInput({ month: 7, records }));
+    // 7월 기본급은 7월 날짜(7/29~7/31)만 = 18시간. 8월 근무가 섞여 들어오지 않는다.
+    assert.equal(july.workMinutes, 18 * 60);
+    assert.equal(july.basePay, payFor(18 * 60, WAGE_2026));
   });
 
-  it('8/31(월)에 시작하는 주는 9월 귀속이므로 8월 급여에서 빠진다', () => {
-    const result = calculatePayroll(
-      baseInput({
-        records: [rec('2026-08-31', 8), rec('2026-09-01', 8), rec('2026-09-02', 8)],
-      }),
-    );
+  it('케이스 4 — 월말에 시작해 다음 달로 이어지는 주는 잘리지 않고 다음 달에 전액 귀속된다', () => {
+    const records = [rec('2026-08-31', 8), rec('2026-09-01', 8), rec('2026-09-02', 8)]; // 24시간
 
-    const week = result.weeks.find((w) => w.weekStart === '2026-08-31');
+    const august = calculatePayroll(baseInput({ month: 8, records }));
+    assert.equal(august.weeks.find((w) => w.weekStart === '2026-08-31'), undefined);
+    assert.equal(august.allowanceMinutes, 0);
+
+    const september = calculatePayroll(baseInput({ year: 2026, month: 9, records }));
+    const week = september.weeks.find((w) => w.weekStart === '2026-08-31');
     assert.ok(week);
     assert.equal(week.weekEnd, '2026-09-06');
-    assert.equal(week.belongsToMonth, 9);
-    assert.equal(week.countedInThisMonth, false);
-    assert.equal(week.allowanceMinutes, 288); // 24h ÷ 5 — 계산은 하되 9월에 귀속
-
-    // 8월 급여에는 8/31 근무 8시간의 기본급만 들어간다
-    assert.equal(result.workMinutes, 480);
-    assert.equal(result.allowanceMinutes, 0);
-    assert.equal(result.allowancePay, 0);
+    assert.equal(week.workMinutes, 24 * 60);
+    assert.equal(week.allowanceMinutes, 288); // 24 ÷ 5 = 4.8h = 288분
   });
 
-  it('7월과 8월을 각각 계산해도 같은 주가 중복 지급되지 않는다', () => {
-    const records = [...recRange('2026-07-27', 5, 4), rec('2026-08-01', 4)];
-    const july = calculatePayroll(baseInput({ month: 7, records }));
-    const august = calculatePayroll(baseInput({ month: 8, records }));
+  it('케이스 5 — 12월→1월 연도 경계도 하나의 연속된 주로 취급한다', () => {
+    const weekStart = startOfWeek('2026-01-01', 1);
+    const records = recRange(weekStart, 7, 3); // 그 주 7일 모두 3시간씩 = 21시간
+    // 기본 membership(입사일 2026-01-01)이 연도 경계 주의 12월 쪽을 잘라내지 않도록 입사일을 앞당긴다.
+    const membership = { joinedAt: '2020-01-01', leftAt: null };
+    const january = calculatePayroll(baseInput({ year: 2026, month: 1, records, membership }));
+    const week = january.weeks.find((w) => w.weekStart === weekStart);
+    assert.ok(week);
+    assert.equal(week.workMinutes, 21 * 60);
+    assert.equal(week.allowanceMinutes, 252); // 21 ÷ 5 = 4.2h = 252분
 
-    const inJuly = july.weeks.find((w) => w.weekStart === '2026-07-27');
-    const inAugust = august.weeks.find((w) => w.weekStart === '2026-07-27');
-    assert.equal(inJuly?.countedInThisMonth, false);
-    assert.equal(inAugust?.countedInThisMonth, true);
+    // 이 주가 실제로 2025년 12월에서 시작했다면, 12월 계산에는 나타나지 않아야 한다.
+    if (compareDate(weekStart, '2026-01-01') < 0) {
+      const december = calculatePayroll(baseInput({ year: 2025, month: 12, records, membership }));
+      assert.equal(december.weeks.find((w) => w.weekStart === weekStart), undefined);
+      assert.equal(december.allowanceMinutes, 0);
+    }
+  });
 
-    // 이 주의 주휴수당은 8월에만 한 번 지급된다
-    assert.equal(july.allowanceMinutes, 0);
-    assert.equal(august.allowanceMinutes, allowanceMinutesFor(24 * 60));
+  it('케이스 6 — 한 직원의 근무기록이 다른 직원의 주간 합계에 영향을 주지 않는다', () => {
+    const employeeARecords = [...recRange('2026-07-29', 3, 6), ...recRange('2026-08-01', 2, 6)]; // 30시간
+    const employeeBRecords = [rec('2026-08-01', 2)]; // 2시간만
+
+    const resultA = calculatePayroll(baseInput({ month: 8, records: employeeARecords }));
+    const resultB = calculatePayroll(baseInput({ month: 8, records: employeeBRecords }));
+
+    const weekA = resultA.weeks.find((w) => w.weekStart === '2026-07-27');
+    assert.equal(weekA?.workMinutes, 30 * 60);
+    assert.equal(weekA?.allowanceMinutes, 360);
+
+    const weekB = resultB.weeks.find((w) => w.weekStart === '2026-07-27');
+    assert.equal(weekB?.workMinutes, 2 * 60);
+    assert.equal(weekB?.allowanceMinutes, 0);
+    assert.equal(resultB.allowanceMinutes, 0);
   });
 });
 
@@ -435,11 +460,11 @@ describe('매장 주 시작 요일 설정', () => {
     const monStart = calculatePayroll(baseInput({ weekStartDay: 1, records }));
     const sunStart = calculatePayroll(baseInput({ weekStartDay: 7, records }));
 
-    // 월요일 시작: 8/1(토)과 8/2(일)이 같은 주(7/27~8/2) → 16시간
+    // 월요일 시작: 8/1(토)~8/2(일)은 7/27(월)에 시작하는 같은 주에 속함 → 16시간
     const monWeek = monStart.weeks.find((w) => w.weekStart === '2026-07-27');
     assert.equal(monWeek?.workMinutes, 960);
 
-    // 일요일 시작: 8/1(토)은 7/26~8/1 주, 8/2(일)은 8/2~8/8 주로 갈린다 → 각각 8시간
+    // 일요일 시작: 8/1(토)은 7/26(일)에 시작하는 주에, 8/2(일)는 그다음 주에 속해 갈린다 → 각각 8시간
     const sunWeek1 = sunStart.weeks.find((w) => w.weekStart === '2026-07-26');
     const sunWeek2 = sunStart.weeks.find((w) => w.weekStart === '2026-08-02');
     assert.equal(sunWeek1?.workMinutes, 480);
