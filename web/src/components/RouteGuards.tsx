@@ -10,7 +10,7 @@ import type { AppRole } from '../types/database.types';
 
 function LoadingScreen() {
   return (
-    <div className="flex min-h-dvh items-center justify-center text-slate-500">
+    <div className="flex min-h-dvh items-center justify-center bg-shell text-ink-soft">
       불러오는 중…
     </div>
   );
@@ -35,9 +35,10 @@ export function RoleRoute({ allow }: { allow: AppRole[] }) {
 
 /** 로그인 후 역할에 맞는 첫 화면으로 보낸다 */
 export function RoleLanding() {
-  const { role, loading } = useAuth();
+  const { role, loading, session } = useAuth();
 
   if (loading) return <LoadingScreen />;
+  if (session && !role) return <Navigate to="/onboarding" replace />;
   if (role === 'OWNER') return <Navigate to="/owner/dashboard" replace />;
   if (role === 'MANAGER') return <Navigate to="/manage" replace />;
   if (role === 'EMPLOYEE') return <Navigate to="/me/dashboard" replace />;

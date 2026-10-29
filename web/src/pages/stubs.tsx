@@ -6,10 +6,10 @@
 
 function Stub({ title, step, children }: { title: string; step: string; children?: string }) {
   return (
-    <section className="rounded-2xl border border-dashed border-slate-300 bg-white p-8">
-      <p className="text-xs font-medium uppercase tracking-wide text-slate-400">{step}</p>
-      <h1 className="mt-1 text-lg font-semibold text-slate-900">{title}</h1>
-      {children && <p className="mt-2 text-sm text-slate-500">{children}</p>}
+    <section className="rounded-2xl border border-dashed border-hairline bg-paper p-8">
+      <p className="text-xs font-medium uppercase tracking-wide text-ink-soft">{step}</p>
+      <h1 className="mt-1 text-lg font-semibold text-ink">{title}</h1>
+      {children && <p className="mt-2 text-sm text-ink-soft">{children}</p>}
     </section>
   );
 }

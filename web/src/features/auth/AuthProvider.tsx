@@ -4,10 +4,11 @@ import type { Session } from '@supabase/supabase-js';
 import { useQuery } from '@tanstack/react-query';
 
 import { supabase } from '../../lib/supabase';
+import { authErrorMessage, withAuthTimeout } from './authError';
 import type { AppRole, Profile, Store, StoreMember } from '../../types/database.types';
 
 export interface Membership extends StoreMember {
-  store: Pick<Store, 'id' | 'name' | 'week_start_day'>;
+  store: Pick<Store, 'id' | 'name' | 'week_start_day' | 'open_time' | 'close_time'>;
 }
 
 interface AuthContextValue {
@@ -20,6 +21,7 @@ interface AuthContextValue {
   /** 화면 라우팅에 쓰는 대표 역할 */
   role: AppRole | null;
   loading: boolean;
+  initializationError: string | null;
   signOut: () => Promise<void>;
 }
 
@@ -28,17 +30,38 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [initializing, setInitializing] = useState(true);
+  const [initializationError, setInitializationError] = useState<string | null>(null);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
-      setInitializing(false);
-    });
+    let active = true;
+    let receivedAuthEvent = false;
+    void withAuthTimeout(supabase.auth.getSession())
+      .then(({ data, error }) => {
+        if (!active || receivedAuthEvent) return;
+        if (error) throw error;
+        setSession(data.session);
+        setInitializationError(null);
+      })
+      .catch((error: unknown) => {
+        if (!active || receivedAuthEvent) return;
+        setSession(null);
+        setInitializationError(authErrorMessage(error));
+      })
+      .finally(() => {
+        if (active) setInitializing(false);
+      });
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, next) => {
+      if (!active) return;
+      receivedAuthEvent = true;
       setSession(next);
+      setInitializing(false);
+      setInitializationError(null);
     });
-    return () => sub.subscription.unsubscribe();
+    return () => {
+      active = false;
+      sub.subscription.unsubscribe();
+    };
   }, []);
 
   const userId = session?.user.id ?? null;
@@ -76,7 +99,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     queryFn: async () => {
       const { data, error } = await supabase
         .from('store_members')
-        .select('*, store:stores(id, name, week_start_day)')
+        .select('*, store:stores(id, name, week_start_day, open_time, close_time)')
         .eq('user_id', userId!)
         .eq('status', 'ACTIVE');
       if (error) throw error;
@@ -90,7 +113,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     // 대표 역할: 소유 매장이 있으면 OWNER, 매니저 소속이 있으면 MANAGER, 그 외 EMPLOYEE
     let role: AppRole | null = null;
-    if (session) {
+    if (session && (ownedStores.length > 0 || memberships.length > 0)) {
       if (ownedStores.length > 0) role = 'OWNER';
       else if (memberships.some((m) => m.role === 'MANAGER')) role = 'MANAGER';
       else role = 'EMPLOYEE';
@@ -102,6 +125,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       ownedStores,
       memberships,
       role,
+      initializationError,
       loading:
         initializing ||
         (!!userId &&
@@ -114,6 +138,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     session,
     userId,
     initializing,
+    initializationError,
     profileQuery.data,
     profileQuery.isLoading,
     storesQuery.data,

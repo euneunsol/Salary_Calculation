@@ -1,8 +1,46 @@
 @import 'tailwindcss';
+@import url('https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@500;700&display=swap');
 
 @theme {
   --font-sans:
     'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Malgun Gothic', sans-serif;
+  --font-wordmark: 'Shippori Mincho', 'Pretendard', serif;
+
+  /* 무명천·화지 — 종이/천 바탕 */
+  --color-paper: #f4efe3;
+  --color-paper-light: #fbf8f1;
+  --color-shell: #eee6d4;
+  --color-ink: #2a2724;
+  --color-ink-soft: #5c5548;
+  --color-hairline: #ddd3bd;
+
+  /* 오마모리 그린 — 브랜드 액센트 */
+  --color-brand-50: #e9f0e9;
+  --color-brand-100: #cfe0d1;
+  --color-brand-500: #4b7857;
+  --color-brand-600: #3f6b4a;
+  --color-brand-700: #335a3d;
+  --color-brand-900: #22301f;
+
+  /* 주인(朱印) — 한코 결재 스탬프 전용 */
+  --color-stamp: #b7472a;
+  --color-stamp-ink: #8f3520;
+  --color-stamp-tint: #f7e3dc;
+
+  /* 청자 — 제출·정보 상태 */
+  --color-celadon: #6b8a95;
+  --color-celadon-tint: #e6edee;
+  --color-celadon-text: #3d525c;
+
+  /* 흙빛 — 대기·경고 상태 */
+  --color-ochre: #a3742f;
+  --color-ochre-tint: #f2e6d3;
+  --color-ochre-text: #7a5320;
+
+  /* 반려·위험 (주인과 구별되는 탁한 적갈색) */
+  --color-rust: #8b3a3a;
+  --color-rust-tint: #f3e1de;
+  --color-rust-text: #6e2e2e;
 }
 
 html,
@@ -13,5 +51,32 @@ body,
 
 body {
   font-family: var(--font-sans);
+  background-color: var(--color-shell);
+  color: var(--color-ink);
   -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background-color: var(--color-brand-100);
+  color: var(--color-brand-900);
+}
+
+/* 화지 질감 — 아주 옅은 종이 결. 장식이 과하지 않도록 저채도·저대비로 고정 */
+.paper-grain {
+  position: relative;
+}
+.paper-grain::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.5;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='matrix' values='0 0 0 0 0.16  0 0 0 0 0.14  0 0 0 0 0.10  0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* 금액·숫자는 표 정렬이 흔들리지 않도록 표 숫자(tabular) 고정 */
+.tabular-nums,
+.font-wordmark {
+  font-variant-numeric: tabular-nums;
 }
