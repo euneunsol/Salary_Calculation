@@ -90,12 +90,33 @@ GPT 명세는 일반적인 Java/Spring 백엔드를 가정했으나, 실제 저�
 | `planned_shifts` | `id, store_id, store_member_id, shift_date, start_time, end_time, crosses_midnight, break_minutes(0/30/60), source_import_row_id, created_by, created_at, updated_at`; `unique(store_member_id, shift_date)` |
 | `shift_imports` | `id, store_id, uploaded_by, target_year, target_month, storage_path, file_sha256, status, ocr_provider, error_message, created_at, applied_at` |
 | `shift_import_rows` | `id, import_id, row_index, raw_name, raw_cell_text, parsed_date, parsed_start, parsed_end, crosses_midnight, ocr_confidence, match_status(MATCHED/AMBIGUOUS/UNMATCHED), store_member_id, candidate_member_ids uuid[], issues text[], review_status, edited_by, edited_at` |
-| `shift_import_events` | `id, import_id, actor_id, event(UPLOADED/PARSED/ROW_EDITED/APPLIED/DISCARDED/FAILED), detail jsonb, created_at` — 클라이언트 쓰기 revoke |
-| RPC | `create_shift_import`, `update_shift_import_row`, `apply_shift_import`, `discard_shift_import` (모두 `security definer`, 내부에서 `is_store_manager`/`is_store_owner` 확인) |
+| `shift_import_events` | `id, import_id, actor_id, event(UPLOADED/PARSED/ROW_EDITED/ROW_EXCLUDED/APPLIED/DISCARDED/FAILED), detail jsonb, created_at` — 클라이언트 쓰기 revoke. `detail` 필수 키는 §3.1.2 |
+| RPC | `create_shift_import`, `update_shift_import_row`, `apply_shift_import`, `discard_shift_import` (모두 `security definer`, 내부에서 `is_store_manager`/`is_store_owner` 확인 — 이유는 §3.1.1) |
 | RLS | 4개 테이블 모두 `enable row level security`. 조회: 매장 매니저·사장님. `planned_shifts`는 본인 행 조회 허용(선택). INSERT/UPDATE/DELETE는 authenticated에서 revoke 후 RPC로만 |
 | Storage | 비공개 버킷 `shift-imports`, 경로 첫 세그먼트 `store_id` 기준 정책 |
 
 기존 헬퍼 `is_store_manager`, `is_store_owner`, `can_review_member`(0002, 0008)를 재사용한다.
+
+`planned_shifts`의 `unique(store_member_id, shift_date)`는 `planned_shifts` 테이블 안에서만 적용된다. `work_records`의 `uq_work_per_day`(0001)와는 별개 테이블·별개 제약이라, 같은 직원·같은 날짜에 예정 근무와 실제 근무가 함께 있어도 어느 쪽 INSERT도 막히지 않는다. 두 테이블 사이에는 FK나 트리거도 두지 않는다.
+
+#### 3.1.1 권한 검증 위치
+
+- **RPC 내부 검증이 최종 권한 판단이다.** `security definer` 함수는 소유자 권한으로 실행되어 RLS를 우회하므로, 함수 안에서 `is_store_manager`/`is_store_owner`를 확인하지 않으면 누구나 다른 매장 데이터를 쓸 수 있다. 기존 `manager_edit_approved_work`(0018)도 같은 이유로 함수 안에서 `can_review_member`를 확인한다. RLS만으로는 대신할 수 없다.
+- Edge Function의 권한 확인은 OCR 호출 비용과 이미지 다운로드를 줄이기 위한 **빠른 실패용**이다. 별도 규칙을 만들지 않고 같은 SQL 헬퍼를 RPC로 호출해 판단하므로 권한 규칙은 DB 한 곳에만 있다.
+
+#### 3.1.2 `shift_import_events.detail` 스키마
+
+| event | `detail` 필수 키 |
+|---|---|
+| `UPLOADED` | `storage_path`, `file_sha256`, `target_year`, `target_month`, `duplicate_of_import_id`(없으면 null) |
+| `PARSED` | `ocr_provider`, `row_count`, `issue_counts`(이슈 코드별 건수) |
+| `ROW_EDITED` | `row_id`, `before`, `after` — 바뀐 필드(`store_member_id`, `parsed_date`, `parsed_start`, `parsed_end`, `crosses_midnight`, `break_minutes`, `on_conflict`)만 담는다. `work_record_history`(0019)의 `before_record`/`after_record` 방식과 같다 |
+| `ROW_EXCLUDED` | `row_id`, `reason`(선택 입력) |
+| `APPLIED` | `inserted_row_ids`, `overwritten`(`[{row_id, planned_shift_id, before}]`), `skipped_row_ids`, `rejected`(`[{row_id, issues}]`) |
+| `DISCARDED` | `reason`(선택 입력) |
+| `FAILED` | `stage`(`DOWNLOAD`/`OCR`/`PARSE`/`SAVE`), `error_code`. OCR 원문, 이미지 URL, 키는 넣지 않는다 |
+
+이벤트 행은 RPC가 같은 트랜잭션에서 INSERT한다. 클라이언트는 INSERT/UPDATE/DELETE 권한이 없다.
 
 ### 3.2 Edge Function (신규 `supabase/functions/parse-shift-image/`)
 
@@ -153,20 +174,40 @@ service_role 키는 사용하지 않는다(사용자 JWT로 RPC 호출 → RLS/�
 | `TIME_INVALID` | 시각 파싱 실패, 분 단위 이상(예: `9:7`), 시작=종료 | 시간 수정 |
 | `TIME_OVERNIGHT` | 종료 < 시작 → `crosses_midnight=true`로 추정 | 추정 확인 |
 | `DURATION_EXCEEDED` | 휴게 제외 근무 > 18시간(`calc_work_minutes`와 동일) | 시간 수정 |
-| `LOW_CONFIDENCE` | OCR 신뢰도 < 임계값(예: 0.8) | 원문 대조 |
+| `LOW_CONFIDENCE` | 정규화 신뢰도 < 공급자별 임계값 (아래 참고) | 원문 대조 |
 | `DUPLICATE_IN_FILE` | 같은 이미지 내 동일 직원·날짜 2건 이상 | 1건 선택 |
-| `DUPLICATE_EXISTING` | `planned_shifts`에 동일 직원·날짜 존재 | **덮어쓰기 여부 명시 선택** (기본: 건너뛰기) |
+| `DUPLICATE_EXISTING` | `planned_shifts`에 동일 직원·날짜 존재 | 행별 `on_conflict`를 `SKIP`(기본) 또는 `OVERWRITE`로 명시 선택. 적용 방식은 §4.4 |
 | `OUTSIDE_STORE_HOURS` | `stores.open_time~close_time`(0011) 밖 | 참고 경고(승인 가능) |
 | `NON_SHIFT_CELL` | `휴`, `OFF`, `-`, 빈칸 | 자동 제외(근무 아님), 경고 없음 |
+
+OCR 신뢰도 정규화: 공급자마다 신뢰도 범위가 다르다(예: Google Vision 0~1, Tesseract 0~100). `ocr.ts` 어댑터가 값을 **0~1로 정규화**해 `ocr_confidence`에 저장한다. 공급자가 신뢰도를 주지 않으면 `null`로 저장하고 `LOW_CONFIDENCE`로 취급한다. 임계값은 코드에 고정하지 않고 공급자별 설정(Edge Function 환경변수, 예: `OCR_MIN_CONFIDENCE`)으로 둔다. 초기값 0.8은 합성 픽스처(§6.3)로 측정한 뒤 정한다. 행 신뢰도는 그 행의 이름 셀과 시간 셀 중 **낮은 값**으로 한다.
 
 셀 표기 정규화 예: `09:00-18:00`, `9:00~18:00`, `9-18`, `09시~18시`, `0900-1800`. 전각 문자·`ㅡ`/`–`/`~` 구분자 통일. `오픈`/`마감` 같은 비수치 표기는 `TIME_INVALID`로 두고 자동 해석하지 않는다(매장별 의미 상이).
 
 ### 4.3 운영 데이터 보호
 
-- 신규 RPC는 `planned_shifts`와 `shift_import*` 테이블에만 쓴다. `work_records`, `payrolls`, `weekly_summaries`, `wage_history`, `store_members`, `stores`에 대한 INSERT/UPDATE/DELETE 문을 포함하지 않는다 — 코드 리뷰 체크 항목 및 테스트(§5.3)로 검증.
+- 신규 RPC는 `planned_shifts`와 `shift_import*` 테이블에만 쓴다. `work_records`, `payrolls`, `weekly_summaries`, `wage_history`, `store_members`, `stores`에 대한 INSERT/UPDATE/DELETE 문을 포함하지 않는다 — 코드 리뷰 체크 항목 및 테스트(§6.2)로 검증.
 - `planned_shifts`는 급여 계산(`calculate_payroll`)의 입력이 아니다. 예정 근무와 실제 근무는 화면에서도 구분 표시한다.
 - 적용 RPC는 서버에서 이슈 재계산 후 처리하므로 클라이언트가 이슈를 지운 행을 강제로 보내도 거절된다.
 - 원본 이미지와 OCR 원문은 직원 이름을 포함하므로 `shift-imports` 버킷은 비공개, 매장 관리자만 접근, 보존 기간 후 삭제. 로그에 원문 이미지 URL·OCR 키를 남기지 않는다.
+
+---
+
+### 4.4 `apply_shift_import` 처리 규칙
+
+입력: `import_id`, `rows: [{row_id, on_conflict}]`. `on_conflict`는 `SKIP` 또는 `OVERWRITE`이고, 값이 없으면 `SKIP`이다.
+
+1. `shift_imports` 행을 `for update`로 잠근 뒤 권한과 상태(`PARSED`인지)를 확인한다. 이렇게 하면 같은 업로드를 두 번 동시에 적용할 수 없다.
+2. 요청된 각 행의 이슈를 서버에서 다시 계산한다. `DUPLICATE_EXISTING`과 `OUTSIDE_STORE_HOURS`를 뺀 이슈가 남은 행, `APPROVED`가 아닌 행은 `rejected`로 분류하고 쓰지 않는다.
+3. 같은 `(store_member_id, shift_date)`의 기존 `planned_shifts` 행을 `for update`로 잠근 뒤 처리한다.
+   - 기존 행 없음: INSERT.
+   - 기존 행 있음 + `SKIP`: 쓰지 않고 `skipped`로 기록.
+   - 기존 행 있음 + `OVERWRITE`: 기존 행의 시간 필드와 `source_import_row_id`, `updated_at`을 UPDATE하고, 이전 값을 `overwritten[].before`에 남긴다. 기존 행을 삭제하지 않는다.
+   - 1~3단계 사이에 다른 트랜잭션이 같은 키를 INSERT한 경우: `insert ... on conflict (store_member_id, shift_date) do nothing`으로 처리하고, 실제로 들어가지 않은 행은 `SKIP`과 같이 `skipped`로 기록한다. 덮어쓰기는 관리자가 명시한 경우에만 일어난다.
+4. 3단계를 모두 마친 뒤 `APPLIED` 이벤트(§3.1.2)를 1건 기록한다. 상태는 rejected/skipped가 없으면 `APPLIED`, 있으면 `PARTIALLY_APPLIED`로 바꾼다.
+5. 함수 전체가 하나의 트랜잭션이다. 중간에 예외가 나면 `planned_shifts`와 이벤트가 모두 롤백된다. rejected 행이 있을 때 전체를 거절할지는 §7 "부분 적용 정책"에서 정하며, 위 규칙은 "승인 행만 적용" 안을 기준으로 썼다.
+
+검토 화면은 `DUPLICATE_EXISTING` 행에 기존 예정 근무와 새 값을 나란히 보여 주고, `SKIP`/`OVERWRITE` 중 하나를 고르게 한다. 화면의 기본 선택도 서버 기본값과 같은 `SKIP`이다.
 
 ---
 
@@ -176,7 +217,7 @@ service_role 키는 사용하지 않는다(사용자 JWT로 RPC 호출 → RLS/�
 2. 대상: 해당 매장 `store_members` × `profiles.name`, 역할 무관(매니저 본인 근무 포함), 기본은 `ACTIVE`.
 3. 정규화 이름 **완전 일치 1명** → `MATCHED`.
 4. 완전 일치 2명 이상 → `AMBIGUOUS` (동명이인).
-5. 완전 일치 없음 + 편집거리 1 후보 존재 → `AMBIGUOUS` (자동 매칭하지 않음, 후보만 제시).
+5. 완전 일치 없음 + 편집거리 1 후보 존재 → `AMBIGUOUS` (자동 매칭하지 않음, 후보만 제시). 편집거리는 정규화 이름의 음절 단위 Levenshtein이다. **편집거리 2 이상은 후보로도 제시하지 않는다**(§0 M9). 프론트와 Edge Function의 `matchMember`는 같은 규칙을 쓴다.
 6. 그 외 → `UNMATCHED`.
 7. (선택) 관리자가 선택한 "이미지 표기 → 구성원" 연결을 매장별 별칭으로 저장해 다음 업로드에서 완전 일치로 취급. 별칭 저장도 관리자 승인 시에만.
 
@@ -204,6 +245,8 @@ service_role 키는 사용하지 않는다(사용자 JWT로 RPC 호출 → RLS/�
 
 ### 6.3 Edge Function / E2E
 
+- Edge Function의 순수 모듈(`parseGrid`, `parseCell`, `matchMember`)은 `deno test`로 실행한다. `index.ts`는 `OcrProvider` mock(고정 OCR JSON 반환, 실패·타임아웃·신뢰도 누락 모드)을 주입해 상태 전이(`PARSED`/`FAILED`)와 `FAILED` 이벤트의 `detail`을 확인한다. 외부 OCR API는 자동 테스트에서 호출하지 않는다.
+- RPC/RLS(§6.2)는 로컬 Supabase(`supabase start` + `supabase db reset`)에서 실행하는 SQL 테스트 스크립트로 자동화한다(예: `supabase/tests/shift_import.sql`, 구현 시 위치 확정). §4.4의 `SKIP`/`OVERWRITE`/동시 INSERT 경합, `ROW_EDITED` 이벤트의 before/after 기록도 이 스크립트에 넣는다. 이 기능은 새 DB 트리거를 추가하지 않으므로, 트리거 테스트는 기존 급여 보호 트리거가 그대로 동작하는지(§6.2-5)만 확인한다.
 - OCR 어댑터는 고정 픽스처(가상 이름으로 만든 합성 근무표 이미지 + 기대 OCR JSON)로 대체해 테스트. **실제 직원 근무표 이미지는 테스트 데이터로 사용하지 않는다.**
 - 5MB 초과, 비이미지 파일(확장자만 png), OCR 실패/타임아웃 → `FAILED` 상태와 사용자 메시지.
 - 업로드 → 검토 → 일부 제외 → 적용 → 예정 근무표에 승인 행만 표시.
