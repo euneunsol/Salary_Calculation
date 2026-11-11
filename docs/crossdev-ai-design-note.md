@@ -36,7 +36,7 @@ GPT 명세는 일반적인 Java/Spring 백엔드를 가정했으나, 실제 저�
 | FR-4 | 매칭된 행을 직원별 **예정 근무표(`planned_shifts`)** 로 매핑한다 | 관리자 승인 후에만 반영 |
 | FR-5 | 이름 불일치·인식 오류·중복 근무는 **관리자 확인 없이는 반영되지 않는다** | 행 단위 승인/수정/제외 |
 | FR-6 | 확정된 근무 기록, 급여 내역, 운영 데이터(`work_records`, `payrolls`, `weekly_summaries`, `wage_history`, `store_members`, `stores`)는 **수정하지 않는다** | 쓰기 경로 자체를 두지 않음 |
-| NFR-1 | 업로드·추출·매칭·승인 이력은 클라이언트가 위변조할 수 없어야 한다 | 서버(definer 함수/Edge Function)만 쓰기 |
+| NFR-1 | 업로드·추출·매칭·승인 이력은 클라이언트가 위변조할 수 없어야 한다 | `security definer` RPC만 쓰기 (Edge Function도 RPC 경유, §3.5) |
 | NFR-2 | 원본 이미지는 직원 개인정보를 포함하므로 매장 관리자만 접근하고 보존 기간을 둔다 | 비공개 버킷, 예: 30일 후 삭제 |
 
 범위 밖: 예정 근무 → 실제 `work_records` 자동 생성, 급여 예상액 계산, 알바생 알림.
@@ -58,7 +58,8 @@ GPT 명세는 일반적인 Java/Spring 백엔드를 가정했으나, 실제 저�
    │ ④ 표 구조 복원 → 셀 파싱 → 후보 행 {raw_name, date, start, end, crosses_midnight, confidence}
    │ ⑤ 이름 매칭 → 매칭 상태/후보 member id
    │ ⑥ 검증 → issue 코드 부여 (§4)
-   │ ⑦ shift_import_rows INSERT, shift_imports.status=PARSED
+   │ ⑦ RPC save_shift_import_parse_result(import_id, rows) → shift_import_rows INSERT,
+   │      shift_imports.status=PARSED (테이블 직접 INSERT 아님, §3.5.3)
    ▼
 [검토 화면]
    │ ⑧ 이슈 있는 행을 상단에 표시. 관리자는 행별로 직원 지정 / 시간 수정 / 제외 / 승인
@@ -91,9 +92,9 @@ GPT 명세는 일반적인 Java/Spring 백엔드를 가정했으나, 실제 저�
 | `shift_imports` | `id, store_id, uploaded_by, target_year, target_month, storage_path, file_sha256, status, ocr_provider, error_message, created_at, applied_at` |
 | `shift_import_rows` | `id, import_id, row_index, raw_name, raw_cell_text, parsed_date, parsed_start, parsed_end, crosses_midnight, ocr_confidence, match_status(MATCHED/AMBIGUOUS/UNMATCHED), store_member_id, candidate_member_ids uuid[], issues text[], review_status, edited_by, edited_at` |
 | `shift_import_events` | `id, import_id, actor_id, event(UPLOADED/PARSED/ROW_EDITED/ROW_EXCLUDED/APPLIED/DISCARDED/FAILED), detail jsonb, created_at` — 클라이언트 쓰기 revoke. `detail` 필수 키는 §3.1.2 |
-| RPC | `create_shift_import`, `update_shift_import_row`, `apply_shift_import`, `discard_shift_import` (모두 `security definer`, 내부에서 `is_store_manager`/`is_store_owner` 확인 — 이유는 §3.1.1) |
-| RLS | 4개 테이블 모두 `enable row level security`. 조회: 매장 매니저·사장님. `planned_shifts`는 본인 행 조회 허용(선택). INSERT/UPDATE/DELETE는 authenticated에서 revoke 후 RPC로만 |
-| Storage | 비공개 버킷 `shift-imports`, 경로 첫 세그먼트 `store_id` 기준 정책 |
+| RPC | `create_shift_import`, `start_shift_import_parse`, `save_shift_import_parse_result`, `fail_shift_import_parse`, `update_shift_import_row`, `apply_shift_import`, `discard_shift_import` (모두 `security definer`, 내부에서 `can_manage_store` 확인 — 이유는 §3.1.1, 작성 규칙은 §3.5.2) |
+| RLS | 4개 테이블 모두 `enable row level security`. 정책·GRANT 명세는 §3.5.1 |
+| Storage | 비공개 버킷 `shift-imports`, 경로 첫 세그먼트 `store_id` 기준 정책. 명세는 §3.5.4 |
 
 기존 헬퍼 `is_store_manager`, `is_store_owner`, `can_review_member`(0002, 0008)를 재사용한다.
 
@@ -128,7 +129,7 @@ GPT 명세는 일반적인 Java/Spring 백엔드를 가정했으나, 실제 저�
 | `parseCell.ts` | 셀 문자열 → 시간 범위 (순수 함수, 프론트와 공유 가능) |
 | `matchMember.ts` | 이름 정규화·매칭 (순수 함수) |
 
-service_role 키는 사용하지 않는다(사용자 JWT로 RPC 호출 → RLS/권한 함수 그대로 적용).
+service_role 키는 사용하지 않는다(사용자 JWT로 RPC 호출 → RLS/권한 함수 그대로 적용). Edge Function도 테이블에 직접 INSERT/UPDATE하지 않고 §3.5.3의 RPC만 호출한다. 사용자 JWT로 실행되므로 테이블 쓰기 권한을 revoke하면 직접 쓰기는 어차피 실패한다.
 
 ### 3.3 프론트엔드 (`web/src/`)
 
@@ -145,7 +146,84 @@ service_role 키는 사용하지 않는다(사용자 JWT로 RPC 호출 → RLS/�
 | `package.json` | `test` 스크립트에 신규 테스트 파일 추가 |
 | `lib/date.ts` | 날짜 유틸 재사용 (`isISODate`, `startOfMonth` 등), 수정 불필요 예상 |
 
-### 3.4 변경하지 않는 모듈
+### 3.5 보안 설계 (2차 보안 리뷰 반영)
+
+저장소에서 확인한 사실을 기준으로 썼다. 검증하지 못한 가정은 §3.5.6에 따로 적었다.
+
+- `0002_rls.sql` 끝의 `grant select, insert, update, delete on all tables in schema public to authenticated`는 **그 시점에 있던 테이블에만** 적용된다. 그런데 Supabase는 보통 public 스키마의 새 테이블·함수에 `anon`, `authenticated` 권한을 기본으로 준다(default privileges). 그래서 신규 테이블은 **명시적으로 revoke하지 않으면 클라이언트가 직접 쓸 수 있다고 가정**한다.
+- 기존에 서버만 쓰는 테이블은 `work_record_history`(0019) 한 곳이다. 이 테이블은 `revoke insert, update, delete ... from authenticated, anon`과 `security definer` 트리거로 보호한다. 신규 테이블도 같은 방식을 따른다.
+- 권한 헬퍼는 모두 `auth.uid()`를 안에서 읽고 `store_id`만 인자로 받는다: `is_store_owner(store_id)`, `is_store_manager(store_id)`, `can_manage_store(store_id)`, `can_manage_member(member_id)`, `owns_member(member_id)`(0002). 사용자 id를 인자로 받는 시그니처는 없다.
+
+#### 3.5.1 RLS 정책과 GRANT
+
+| 테이블 | SELECT (RLS `using`) | 클라이언트 INSERT/UPDATE/DELETE |
+|---|---|---|
+| `shift_imports` | `can_manage_store(store_id)` | revoke. 쓰기는 RPC만 |
+| `shift_import_rows` | `can_manage_import(import_id)` (신규 헬퍼, 아래 참고) | revoke. 쓰기는 RPC만 |
+| `shift_import_events` | `can_manage_import(import_id)` | revoke. 쓰기는 RPC만 |
+| `planned_shifts` | `can_manage_store(store_id)`, (선택) `owns_member(store_member_id)` | revoke. 쓰기는 `apply_shift_import`만 |
+
+- 마이그레이션에서 테이블마다 `grant select ... to authenticated`와 `revoke insert, update, delete ... from authenticated, anon`을 둘 다 적는다. INSERT/UPDATE/DELETE 정책은 만들지 않는다. 권한(GRANT)과 정책(RLS) 두 겹으로 막는 것이다.
+- `can_manage_import(p_import_id)`는 `can_manage_member`(0002)와 같은 형태의 `stable security definer` 헬퍼로 만든다. `shift_imports`에서 `store_id`를 찾아 `can_manage_store`를 호출한다. `shift_import_rows` 정책에서 `shift_imports`를 직접 서브쿼리해도 동작하지만, 0002의 원칙(판정 로직은 헬퍼 함수로 감싼다)을 따른다.
+- `anon`에는 SELECT도 주지 않는다.
+
+#### 3.5.2 `security definer` RPC 작성 규칙
+
+쓰기 권한을 revoke했으므로 쓰기는 `security definer` RPC로만 가능하다. 이것은 기존 패턴(0011, 0018, 0019)을 따른 것이고, 모든 함수를 definer로 만들라는 뜻은 아니다. 조회는 definer 함수 없이 RLS로 처리한다.
+
+1. `set search_path = public`을 지정한다(기존 함수와 같다).
+2. 함수 첫 부분에서 `auth.uid() is null`이면 거절하고, 대상 import/store를 `for update`로 잠근 뒤 `can_manage_store`로 권한을 확인한다. definer 함수는 RLS를 우회하므로 이 확인이 빠지면 다른 매장 데이터를 쓸 수 있다(§3.1.1).
+3. `revoke all on function ... from public, anon` 후 `grant execute ... to authenticated`. 기존 마이그레이션은 `from public`만 revoke한다. Supabase default privileges가 `anon`에 직접 EXECUTE를 주는 경우 `from public`만으로는 회수되지 않으므로 `anon`을 함께 적는다.
+4. 행 id를 인자로 받는 RPC(`update_shift_import_row` 등)는 그 행의 `import_id`가 인자로 받은 import와 같은지, 그 import의 `store_id`에 권한이 있는지 함께 확인한다.
+5. `store_member_id`를 지정·수정할 때는 그 구성원이 같은 매장 소속인지 확인한다(`store_members.store_id = shift_imports.store_id`). 다른 매장 직원 id를 넣어 `planned_shifts`를 만드는 것을 막는다.
+6. 함수 소유자는 기존 함수처럼 마이그레이션 실행 역할이다. 별도 소유자 역할은 만들지 않는다.
+
+#### 3.5.3 Edge Function의 쓰기 경로
+
+이전 초안은 ⑦에서 Edge Function이 `shift_import_rows`에 직접 INSERT하는 것처럼 썼다. 그런데 §3.5.1에서 클라이언트 쓰기를 revoke하므로, 사용자 JWT로 실행하는 Edge Function은 직접 INSERT할 수 없다. 그래서 다음 RPC로 바꾼다.
+
+| RPC | 허용 상태 전이 | 비고 |
+|---|---|---|
+| `start_shift_import_parse(import_id)` | `UPLOADED → PARSING` (재시도면 `FAILED → PARSING`) | 동시에 두 번 파싱하는 것을 막는다 |
+| `save_shift_import_parse_result(import_id, rows jsonb, ocr_provider, file_sha256)` | `PARSING → PARSED` | 한 번만 허용. 행 수 상한(예: 31일 × 100명). `PARSED` 이벤트를 같은 트랜잭션에서 기록 |
+| `fail_shift_import_parse(import_id, stage, error_code)` | `PARSING → FAILED` | `FAILED` 이벤트 기록 |
+
+**남는 위험:** 이 RPC는 사용자 JWT로 호출되므로, 그 매장의 매니저는 Edge Function을 거치지 않고 직접 호출해 OCR 결과(`raw_cell_text`, `ocr_confidence`)를 임의 값으로 넣을 수 있다. 다만 매니저는 원래 검토 단계에서 모든 행을 수정할 수 있고, 적용 RPC가 서버에서 다시 검증한다(§4.4). 따라서 추가로 얻는 권한은 없고, 영향은 "OCR 원문 기록이 실제 OCR 결과라는 보장이 없다"는 감사 측면에 한정된다. 다른 매장이나 다른 사용자로 확대되지는 않는다. 이를 막으려면 service_role로만 실행 가능한 RPC가 필요하다. 하지만 README는 service_role을 Edge Function 환경변수로만 쓰라고 하고, 사용 시 RLS가 전부 우회되므로 기본안으로 채택하지 않는다. §7 미결 사항으로 둔다.
+
+#### 3.5.4 Storage 정책 (`storage.objects`, 버킷 `shift-imports`)
+
+현재 저장소의 마이그레이션에는 Storage 버킷과 정책이 없다. 새로 정의해야 한다.
+
+- 버킷: `public = false`, `file_size_limit` 5MB, `allowed_mime_types`는 png/jpeg/webp. 서버의 매직 바이트 확인(§4.1)은 그대로 둔다. 버킷의 MIME 제한은 클라이언트가 보낸 Content-Type만 보기 때문이다.
+- 경로: `{store_id}/{import_id}.{ext}`. 정책 조건은 `bucket_id = 'shift-imports' and can_manage_store(((storage.foldername(name))[1])::uuid)`.
+  - SELECT, INSERT: 위 조건.
+  - UPDATE: 정책 없음(덮어쓰기 금지). 다시 올리려면 새 import를 만든다.
+  - DELETE: 정책 없음. 보존 기간이 지난 파일 삭제 방식은 §7에서 정한다.
+- 첫 세그먼트가 uuid가 아니면 캐스트에서 오류가 나 요청이 거절된다. 구현 시 거절(오류)로 끝나는지 테스트한다(§6.2).
+- `create_shift_import`는 `storage_path`가 `{p_store_id}/` 로 시작하는지 확인한다. 다른 매장 경로를 자기 import에 연결하는 것을 막는다.
+- 클라이언트가 보낸 `file_sha256`은 신뢰하지 않는다. Edge Function이 내려받은 바이트로 다시 계산해 `save_shift_import_parse_result`에 넘기고, 중복 판정(§4.1)은 서버가 계산한 값으로 한다.
+- 이미지는 Storage 정책상 해당 매장 관리자만 읽을 수 있다. 화면에는 짧은 만료의 signed URL로만 보여 주고, URL을 로그나 `shift_import_events.detail`에 남기지 않는다(§3.1.2).
+
+#### 3.5.5 리뷰 항목별 판정
+
+| # | 2차 리뷰 주장 | 판정 | 근거 |
+|---|---|---|---|
+| 1 | 설계상 클라이언트가 `shift_import_rows`에 직접 쓸 수 있다 | **일부 타당.** 설계에 그런 문구는 없었다(§3.1은 revoke라고 썼다). 그러나 ⑦의 Edge Function 직접 INSERT와 revoke가 서로 맞지 않았다 | §3.5.3에서 RPC 경로로 고침 |
+| 2 | JWT를 탈취하면 임의 매장에 쓸 수 있다 | **기각.** RPC가 `auth.uid()` 기준으로 매장 권한을 확인하므로, 탈취한 JWT로는 그 사용자 권한까지만 쓸 수 있다. 토큰 탈취 자체는 앱 전체의 공통 위험이다 | §3.5.2-2 |
+| 3 | `shift_import_events` revoke 설정이 문서에 없다 | **타당.** GRANT/REVOKE를 구체적으로 명시함 | §3.5.1 |
+| 4 | RLS `using`/`with check` 조건이 없다 | **타당.** 정책을 표로 명시함. 리뷰의 예시(`auth.role`, `session.store_id`, `is_store_manager(user_id, store_id)`)는 저장소에 없는 이름·시그니처라 쓰지 않았다 | §3.5.1 |
+| 5 | Storage 버킷 정책이 없다 | **타당.** 저장소에 Storage 정의가 없다는 것도 확인함 | §3.5.4 |
+| 6 | `is_store_manager`/`is_store_owner`가 없다 | **기각.** 0002에 이미 있다 | 0002_rls.sql |
+| 7 | `shift_import_rows`를 거쳐 급여·근무 기록이 바뀔 수 있다 | **기각(이미 반영).** FK·트리거를 두지 않고, 신규 RPC에 해당 테이블 쓰기 문을 넣지 않는다 | §3.1, §4.3, §6.2-4 |
+| — | 모든 RPC를 `SECURITY DEFINER` + 별도 특권 역할(`api_owner`) 소유로 | **부분 채택.** 쓰기 RPC만 definer로 하고, 조회는 RLS로 한다. 별도 소유자 역할은 기존 마이그레이션과 다르고 이점이 확인되지 않아 채택하지 않음 | §3.5.2 |
+
+#### 3.5.6 검증하지 못한 가정
+
+- 운영·스테이징 프로젝트의 default privileges 설정(신규 테이블·함수에 `anon`/`authenticated` 권한이 자동으로 붙는지). 이 설계는 "자동으로 붙는다"는 보수적 가정으로 썼다. 구현 시 로컬 DB에서 `has_table_privilege`·`has_function_privilege`로 확인한다(§6.2-7).
+- 기존 RPC들이 `anon`에서 실행 가능한지 여부. 이번 범위에서 기존 함수는 바꾸지 않는다. 기존 함수는 내부에서 `auth.uid()` 기반 권한을 확인하므로 `anon` 호출은 권한 확인에서 거절될 것으로 보이지만, 실제로 확인하지 않았다.
+- Edge Function 배포 설정(`verify_jwt`), CORS, 호출 빈도 제한. 저장소에 Edge Function이 아직 없어 확인할 수 없다.
+
+### 3.6 변경하지 않는 모듈
 
 `work_records` 관련 마이그레이션·트리거·RPC(0001, 0005, 0008, 0018, 0019), 급여 계산(`calculate_payroll`, `payrollCalc.ts`), 시급(`wage_history`, `set_wage`), 구성원(`store_members`), 급여 화면 전부.
 
@@ -242,6 +320,9 @@ OCR 신뢰도 정규화: 공급자마다 신뢰도 범위가 다르다(예: Goog
 4. 적용 전후 `work_records`, `payrolls`, `weekly_summaries`, `wage_history` 행 수와 체크섬(`md5(string_agg(...))`)이 **동일**.
 5. 급여 `CONFIRMED`/`PAID` 월을 대상으로 업로드·적용해도 위 테이블 변화 없음.
 6. 같은 이미지 재업로드 → 중복 경고, `DUPLICATE_EXISTING` 행은 기본 건너뛰기.
+7. 권한 확인: 신규 4개 테이블에 대해 `has_table_privilege('authenticated'/'anon', ..., 'INSERT'/'UPDATE'/'DELETE')`가 모두 false, 신규 RPC에 대해 `has_function_privilege('anon', ..., 'EXECUTE')`가 false.
+8. 매장 A 매니저가 매장 B의 `import_id`·`row_id`·`store_member_id`를 넣어 각 RPC 호출 → 거절. `save_shift_import_parse_result`를 `PARSED` 상태에서 다시 호출 → 거절.
+9. Storage: 매장 A 매니저가 `{매장 B id}/...` 경로로 업로드·조회, 기존 객체 덮어쓰기·삭제, 첫 세그먼트가 uuid가 아닌 경로 업로드 → 모두 거절. 알바생 계정은 같은 매장 경로도 조회 불가.
 
 ### 6.3 Edge Function / E2E
 
@@ -265,4 +346,5 @@ OCR 신뢰도 정규화: 공급자마다 신뢰도 범위가 다르다(예: Goog
 | OCR 공급자 | 외부 Vision API(정확도↑, 개인정보 외부 전송 → 동의/약관 검토 필요) vs 자체 Tesseract(정확도↓, Edge Function 런타임 제약) vs 멀티모달 LLM 표 추출 |
 | 부분 적용 정책 | 이슈 행이 있으면 전체 거절 vs 승인된 행만 적용 |
 | 알바생 노출 | 예정 근무를 알바생 달력에 표시할지, 표시 시 `work_records` 임시저장 생성 보조로 쓸지 (현재 범위 밖) |
-| 이미지 보존 기간 | 30일 제안, 매장 정책 확인 필요 |
+| 이미지 보존 기간 | 30일 제안, 매장 정책 확인 필요. 삭제 주체(Storage 삭제 권한이 필요하므로 service_role을 쓰는 예약 작업 vs 매니저 화면에서 수동 삭제)도 함께 정한다 |
+| OCR 원문 위조 방지 | §3.5.3의 남는 위험을 받아들일지, OCR 결과 저장 RPC만 service_role 전용으로 분리할지. 분리하면 service_role 키 관리와 Edge Function 내부 권한 확인이 새로 필요하다 |
