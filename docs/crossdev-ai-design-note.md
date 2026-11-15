@@ -89,7 +89,7 @@ GPT 명세는 일반적인 Java/Spring 백엔드를 가정했으나, 실제 저�
 | 객체 | 내용 |
 |---|---|
 | `planned_shifts` | `id, store_id, store_member_id, shift_date, start_time, end_time, crosses_midnight, break_minutes(0/30/60), source_import_row_id, created_by, created_at, updated_at`; `unique(store_member_id, shift_date)` |
-| `shift_imports` | `id, store_id, uploaded_by, target_year, target_month, storage_path, file_sha256, status, ocr_provider, error_message, created_at, applied_at` |
+| `shift_imports` | `id, store_id, uploaded_by, target_year, target_month, storage_path, file_sha256, parse_result_sha256, status, ocr_provider, error_message, created_at, applied_at` (`parse_result_sha256`은 §3.5.7-1) |
 | `shift_import_rows` | `id, import_id, row_index, raw_name, raw_cell_text, parsed_date, parsed_start, parsed_end, crosses_midnight, ocr_confidence, match_status(MATCHED/AMBIGUOUS/UNMATCHED), store_member_id, candidate_member_ids uuid[], issues text[], review_status, edited_by, edited_at` |
 | `shift_import_events` | `id, import_id, actor_id, event(UPLOADED/PARSED/ROW_EDITED/ROW_EXCLUDED/APPLIED/DISCARDED/FAILED), detail jsonb, created_at` — 클라이언트 쓰기 revoke. `detail` 필수 키는 §3.1.2 |
 | RPC | `create_shift_import`, `start_shift_import_parse`, `save_shift_import_parse_result`, `fail_shift_import_parse`, `update_shift_import_row`, `apply_shift_import`, `discard_shift_import` (모두 `security definer`, 내부에서 `can_manage_store` 확인 — 이유는 §3.1.1, 작성 규칙은 §3.5.2) |
@@ -110,7 +110,7 @@ GPT 명세는 일반적인 Java/Spring 백엔드를 가정했으나, 실제 저�
 | event | `detail` 필수 키 |
 |---|---|
 | `UPLOADED` | `storage_path`, `file_sha256`, `target_year`, `target_month`, `duplicate_of_import_id`(없으면 null) |
-| `PARSED` | `ocr_provider`, `row_count`, `issue_counts`(이슈 코드별 건수) |
+| `PARSED` | `ocr_provider`, `row_count`, `issue_counts`(이슈 코드별 건수), `file_sha256`(서버 계산값), `parse_result_sha256` |
 | `ROW_EDITED` | `row_id`, `before`, `after` — 바뀐 필드(`store_member_id`, `parsed_date`, `parsed_start`, `parsed_end`, `crosses_midnight`, `break_minutes`, `on_conflict`)만 담는다. `work_record_history`(0019)의 `before_record`/`after_record` 방식과 같다 |
 | `ROW_EXCLUDED` | `row_id`, `reason`(선택 입력) |
 | `APPLIED` | `inserted_row_ids`, `overwritten`(`[{row_id, planned_shift_id, before}]`), `skipped_row_ids`, `rejected`(`[{row_id, issues}]`) |
@@ -163,7 +163,7 @@ service_role 키는 사용하지 않는다(사용자 JWT로 RPC 호출 → RLS/�
 | `shift_import_events` | `can_manage_import(import_id)` | revoke. 쓰기는 RPC만 |
 | `planned_shifts` | `can_manage_store(store_id)`, (선택) `owns_member(store_member_id)` | revoke. 쓰기는 `apply_shift_import`만 |
 
-- 마이그레이션에서 테이블마다 `grant select ... to authenticated`와 `revoke insert, update, delete ... from authenticated, anon`을 둘 다 적는다. INSERT/UPDATE/DELETE 정책은 만들지 않는다. 권한(GRANT)과 정책(RLS) 두 겹으로 막는 것이다.
+- 마이그레이션에서 테이블마다 `revoke all ... from public, anon, authenticated` 뒤에 `grant select ... to authenticated`만 다시 준다. `revoke insert, update, delete`만으로는 default privileges가 준 `TRUNCATE`·`REFERENCES`·`TRIGGER`가 남는다. 특히 `TRUNCATE`는 RLS가 적용되지 않는다. INSERT/UPDATE/DELETE 정책은 만들지 않는다. 권한(GRANT)과 정책(RLS) 두 겹으로 막는 것이다. SQL 예시는 §3.5.7-2.
 - `can_manage_import(p_import_id)`는 `can_manage_member`(0002)와 같은 형태의 `stable security definer` 헬퍼로 만든다. `shift_imports`에서 `store_id`를 찾아 `can_manage_store`를 호출한다. `shift_import_rows` 정책에서 `shift_imports`를 직접 서브쿼리해도 동작하지만, 0002의 원칙(판정 로직은 헬퍼 함수로 감싼다)을 따른다.
 - `anon`에는 SELECT도 주지 않는다.
 
@@ -188,7 +188,7 @@ service_role 키는 사용하지 않는다(사용자 JWT로 RPC 호출 → RLS/�
 | `save_shift_import_parse_result(import_id, rows jsonb, ocr_provider, file_sha256)` | `PARSING → PARSED` | 한 번만 허용. 행 수 상한(예: 31일 × 100명). `PARSED` 이벤트를 같은 트랜잭션에서 기록 |
 | `fail_shift_import_parse(import_id, stage, error_code)` | `PARSING → FAILED` | `FAILED` 이벤트 기록 |
 
-**남는 위험:** 이 RPC는 사용자 JWT로 호출되므로, 그 매장의 매니저는 Edge Function을 거치지 않고 직접 호출해 OCR 결과(`raw_cell_text`, `ocr_confidence`)를 임의 값으로 넣을 수 있다. 다만 매니저는 원래 검토 단계에서 모든 행을 수정할 수 있고, 적용 RPC가 서버에서 다시 검증한다(§4.4). 따라서 추가로 얻는 권한은 없고, 영향은 "OCR 원문 기록이 실제 OCR 결과라는 보장이 없다"는 감사 측면에 한정된다. 다른 매장이나 다른 사용자로 확대되지는 않는다. 이를 막으려면 service_role로만 실행 가능한 RPC가 필요하다. 하지만 README는 service_role을 Edge Function 환경변수로만 쓰라고 하고, 사용 시 RLS가 전부 우회되므로 기본안으로 채택하지 않는다. §7 미결 사항으로 둔다.
+**남는 위험:** (§3.5.7-1에서 일부 보완) 이 RPC는 사용자 JWT로 호출되므로, 그 매장의 매니저는 Edge Function을 거치지 않고 직접 호출해 OCR 결과(`raw_cell_text`, `ocr_confidence`)를 임의 값으로 넣을 수 있다. 다만 매니저는 원래 검토 단계에서 모든 행을 수정할 수 있고, 적용 RPC가 서버에서 다시 검증한다(§4.4). 따라서 추가로 얻는 권한은 없고, 영향은 "OCR 원문 기록이 실제 OCR 결과라는 보장이 없다"는 감사 측면에 한정된다. 다른 매장이나 다른 사용자로 확대되지는 않는다. 이를 막으려면 service_role로만 실행 가능한 RPC가 필요하다. 하지만 README는 service_role을 Edge Function 환경변수로만 쓰라고 하고, 사용 시 RLS가 전부 우회되므로 기본안으로 채택하지 않는다. §7 미결 사항으로 둔다.
 
 #### 3.5.4 Storage 정책 (`storage.objects`, 버킷 `shift-imports`)
 
@@ -222,6 +222,98 @@ service_role 키는 사용하지 않는다(사용자 JWT로 RPC 호출 → RLS/�
 - 운영·스테이징 프로젝트의 default privileges 설정(신규 테이블·함수에 `anon`/`authenticated` 권한이 자동으로 붙는지). 이 설계는 "자동으로 붙는다"는 보수적 가정으로 썼다. 구현 시 로컬 DB에서 `has_table_privilege`·`has_function_privilege`로 확인한다(§6.2-7).
 - 기존 RPC들이 `anon`에서 실행 가능한지 여부. 이번 범위에서 기존 함수는 바꾸지 않는다. 기존 함수는 내부에서 `auth.uid()` 기반 권한을 확인하므로 `anon` 호출은 권한 확인에서 거절될 것으로 보이지만, 실제로 확인하지 않았다.
 - Edge Function 배포 설정(`verify_jwt`), CORS, 호출 빈도 제한. 저장소에 Edge Function이 아직 없어 확인할 수 없다.
+
+#### 3.5.7 3차(최종) 리뷰 반영
+
+검토 기준 커밋 `7554216`. 리뷰 주장과 저장소를 대조해 판정했다. 리뷰 원문은 입력 자료로만 썼다.
+
+| # | 최종 리뷰 주장 / 수정 지시 | 판정 | 반영 위치 |
+|---|---|---|---|
+| F1 | OCR 결과를 매니저가 변조할 수 있다 → 파일 SHA-256·결과 해시를 DB에 저장하고 적용 시 검증 | **일부 채택.** 위험은 §3.5.3에 이미 적혀 있었다. 결과 해시를 저장하고 적용 때 검증하는 것은 채택한다. 다만 이 해시는 **저장된 뒤에 바뀌었는지**만 알려 준다. 매니저가 `save_shift_import_parse_result`를 직접 호출해 처음부터 가짜 값을 넣는 것은 막지 못한다. 해시를 DB가 그 값으로 계산하기 때문이다. 이걸 막으려면 §7 "OCR 원문 위조 방지"의 service_role 분리안이 필요하다 | 아래 1 |
+| F2 | RLS가 구체적이지 않다 → store_id·role 기반 `with check` 정책 | **일부 채택.** SELECT 정책은 §3.5.1에 표로 있었다. 이번에 SQL로 구체화한다. `with check`는 채택하지 않는다. `with check`는 INSERT/UPDATE 정책에만 붙는다. 이 설계는 클라이언트 쓰기 정책을 아예 두지 않으므로, 정책을 만들면 오히려 쓰기 경로가 생긴다 | 아래 2 |
+| F3 | definer RPC에 store 권한 검증이 누락됐다 → 필수 주석·테스트 | **주장 기각, 지시 채택.** 검증 누락은 사실이 아니다. §3.1.1과 §3.5.2-2에 필수로 적혀 있고, 테스트는 §6.2-1·8에 있다. 대신 함수 골격 예시와 필수 주석 규칙을 추가한다 | 아래 3, §6.2-10 |
+| F4 | default grant가 과도하다 → 개별 grant + revoke migration 예시 | **채택.** 위험은 §3.5에서 이미 가정했다. 이번에 `revoke all`로 바꾸고(TRUNCATE 포함) 예시를 추가한다. `alter default privileges`로 스키마 기본값 자체를 바꾸는 것은 다른 기능의 테이블에도 영향을 주므로 범위 밖으로 둔다 | §3.5.1, 아래 2 |
+| F5 | service_role을 모든 Edge Function·RPC에 쓴다 → `ocr_service_role`/`import_service_role`로 분리 | **기각.** 사실과 다르다. 이 설계는 service_role을 쓰지 않는다(§3.2). 신규 RPC는 모두 사용자 JWT(`authenticated`)로 실행된다. 저장소에도 커스텀 DB 역할이 없다. PostgREST가 이 역할로 전환하려면 JWT `role` claim을 직접 발급해야 해서 새 비밀키 관리가 생긴다. 역할을 나누는 문제는 §7 "OCR 원문 위조 방지"를 결정할 때 함께 다룬다 | §7 |
+| V1 | RLS가 실제 Supabase에 적용됐는지 검증 | **이번에 수행 불가.** 설계 단계라 마이그레이션이 없다. 운영 DB 접근은 금지돼 있다. 구현 후 로컬 DB에서 §6.2-7·11로 확인한다 | §6.2 |
+| V2 | Edge Function의 JWT 검증·CORS 배포 확인 | **이번에 수행 불가.** 저장소에 `supabase/functions/`가 없다(§3.5.6). 배포 기준만 아래 4에 적는다 | 아래 4 |
+| V3 | migration에 revoke 구문이 있는지 검증 | **설계에 반영.** 아래 2의 예시에 넣었다. 구현 후 §6.2-7로 확인한다 | 아래 2 |
+
+**1. 파싱 결과 해시 (F1)**
+
+- `file_sha256`: Edge Function이 내려받은 바이트로 다시 계산한 값이다(§3.5.4). `save_shift_import_parse_result`는 이 값이 `create_shift_import` 때 기록된 값과 다르면 거절한다(업로드 후 파일이 바뀐 경우).
+- `parse_result_sha256`: `save_shift_import_parse_result`가 **DB 안에서** 계산한다. 클라이언트나 Edge Function이 보낸 해시는 받지 않는다. 계산 대상은 수정할 수 없는 원본 열 `row_index, raw_name, raw_cell_text, ocr_confidence`다. 관리자가 바꿀 수 있는 열(`store_member_id`, 시간, `review_status`)은 넣지 않는다.
+
+  ```sql
+  select encode(sha256(convert_to(coalesce(string_agg(
+           jsonb_build_array(row_index, raw_name, raw_cell_text, ocr_confidence)::text,
+           E'\n' order by row_index), ''), 'UTF8')), 'hex')
+    from public.shift_import_rows where import_id = p_import_id;
+  ```
+- `apply_shift_import`는 §4.4-1 바로 뒤에서 같은 식으로 다시 계산한다. 저장된 값과 다르면 `raise exception`으로 전체를 거절한다. 이렇게 하면 RPC 바깥 경로(직접 SQL, 이후 버그)로 원본 열이 바뀐 것을 잡을 수 있다.
+- 한계는 표 F1에 적은 대로다. 문서와 화면에서 "OCR 원문 = 실제 OCR 결과"라고 표시하지 않는다.
+
+**2. RLS·GRANT 마이그레이션 예시 (F2, F4, V3)**
+
+```sql
+-- 신규 4개 테이블 공통
+alter table public.shift_import_rows enable row level security;
+revoke all on table public.shift_import_rows from public, anon, authenticated;
+grant select on table public.shift_import_rows to authenticated;
+
+create policy "매장 관리자는 import 행 조회" on public.shift_import_rows
+  for select to authenticated
+  using (public.can_manage_import(import_id));
+-- INSERT/UPDATE/DELETE 정책은 만들지 않는다 (쓰기는 RPC만).
+
+-- planned_shifts
+create policy "매장 관리자는 예정 근무 조회" on public.planned_shifts
+  for select to authenticated
+  using (public.can_manage_store(store_id));
+-- (선택) 알바생 본인 조회: using (public.owns_member(store_member_id))
+
+-- 헬퍼와 RPC
+revoke all on function public.can_manage_import(uuid) from public, anon;
+grant execute on function public.can_manage_import(uuid) to authenticated;
+
+-- Storage (storage.objects)
+create policy "shift-imports 조회" on storage.objects for select to authenticated
+  using (bucket_id = 'shift-imports'
+         and public.can_manage_store(((storage.foldername(name))[1])::uuid));
+create policy "shift-imports 업로드" on storage.objects for insert to authenticated
+  with check (bucket_id = 'shift-imports'
+              and public.can_manage_store(((storage.foldername(name))[1])::uuid));
+```
+
+`shift_imports`·`shift_import_events`도 같은 형태다. 시퀀스는 쓰지 않는다(`id`는 uuid 기본값). role 조건은 헬퍼가 `store_members.role`·`stores.owner_id`로 판단하므로(0002) 정책에 따로 적지 않는다.
+
+**3. RPC 골격과 필수 주석 (F3)**
+
+```sql
+create or replace function public.apply_shift_import(p_import_id uuid, p_rows jsonb)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare v_import public.shift_imports;
+begin
+  -- [필수] SECURITY DEFINER는 RLS를 우회한다. 아래 두 확인을 지우지 말 것 (§3.1.1).
+  if auth.uid() is null then raise exception '로그인이 필요합니다.'; end if;
+  select * into v_import from public.shift_imports where id = p_import_id for update;
+  if not found or not public.can_manage_store(v_import.store_id) then
+    raise exception '담당 매장의 관리자만 처리할 수 있습니다.';
+  end if;
+  -- 이후: 상태 확인 → 해시 검증(위 1) → §4.4 처리
+  ...
+end $$;
+revoke all on function public.apply_shift_import(uuid, jsonb) from public, anon;
+grant execute on function public.apply_shift_import(uuid, jsonb) to authenticated;
+```
+
+존재하지 않는 import와 권한 없는 import에 같은 메시지를 돌려준다. 다른 매장 import id가 있는지 알 수 없게 하기 위해서다. 0018도 `if not found or not can_review_member(...)`로 같은 방식을 쓴다. 코드 리뷰에서는 신규 definer 함수마다 `[필수]` 주석과 두 확인이 있는지 본다.
+
+**4. Edge Function 배포 기준 (V2)**
+
+- `verify_jwt = true`(기본값)를 유지한다. 함수 안에서도 `Authorization` 헤더로 만든 클라이언트의 `auth.getUser()`가 실패하면 401을 돌려준다.
+- CORS는 `Access-Control-Allow-Origin`을 앱 도메인 목록으로 제한한다. `*`는 쓰지 않는다. `OPTIONS` 응답에는 본문이나 데이터를 넣지 않는다.
+- OCR 키는 `supabase secrets`에만 둔다. 응답 본문과 로그에 키, 이미지 URL, OCR 원문을 남기지 않는다(§3.1.2).
+- 배포는 이 설계의 범위가 아니다. 구현 PR에서 위 항목을 체크리스트로 확인한다.
 
 ### 3.6 변경하지 않는 모듈
 
@@ -323,6 +415,9 @@ OCR 신뢰도 정규화: 공급자마다 신뢰도 범위가 다르다(예: Goog
 7. 권한 확인: 신규 4개 테이블에 대해 `has_table_privilege('authenticated'/'anon', ..., 'INSERT'/'UPDATE'/'DELETE')`가 모두 false, 신규 RPC에 대해 `has_function_privilege('anon', ..., 'EXECUTE')`가 false.
 8. 매장 A 매니저가 매장 B의 `import_id`·`row_id`·`store_member_id`를 넣어 각 RPC 호출 → 거절. `save_shift_import_parse_result`를 `PARSED` 상태에서 다시 호출 → 거절.
 9. Storage: 매장 A 매니저가 `{매장 B id}/...` 경로로 업로드·조회, 기존 객체 덮어쓰기·삭제, 첫 세그먼트가 uuid가 아닌 경로 업로드 → 모두 거절. 알바생 계정은 같은 매장 경로도 조회 불가.
+10. 각 쓰기 RPC를 (a) 로그아웃 상태, (b) 같은 매장 알바생, (c) 다른 매장 매니저, (d) 없는 `import_id`로 호출 → 모두 거절. (c)와 (d)의 오류 메시지가 같다.
+11. 권한 추가 확인: 신규 4개 테이블에 `has_table_privilege('authenticated'/'anon', ..., 'TRUNCATE')`가 false, `anon`은 `SELECT`도 false. `pg_policies`에서 신규 테이블 정책이 SELECT 하나씩만 있다.
+12. 해시: `PARSED` 뒤 테스트용 superuser로 `shift_import_rows.raw_cell_text`를 직접 바꾸고 `apply_shift_import` 호출 → 전체 거절, `planned_shifts` 변화 없음. `save_shift_import_parse_result`에 업로드 때와 다른 `file_sha256`을 넘기면 거절.
 
 ### 6.3 Edge Function / E2E
 
@@ -347,4 +442,4 @@ OCR 신뢰도 정규화: 공급자마다 신뢰도 범위가 다르다(예: Goog
 | 부분 적용 정책 | 이슈 행이 있으면 전체 거절 vs 승인된 행만 적용 |
 | 알바생 노출 | 예정 근무를 알바생 달력에 표시할지, 표시 시 `work_records` 임시저장 생성 보조로 쓸지 (현재 범위 밖) |
 | 이미지 보존 기간 | 30일 제안, 매장 정책 확인 필요. 삭제 주체(Storage 삭제 권한이 필요하므로 service_role을 쓰는 예약 작업 vs 매니저 화면에서 수동 삭제)도 함께 정한다 |
-| OCR 원문 위조 방지 | §3.5.3의 남는 위험을 받아들일지, OCR 결과 저장 RPC만 service_role 전용으로 분리할지. 분리하면 service_role 키 관리와 Edge Function 내부 권한 확인이 새로 필요하다 |
+| OCR 원문 위조 방지 | §3.5.3의 남는 위험을 받아들일지(결과 해시는 저장 뒤 변경만 잡는다, §3.5.7-1), OCR 결과 저장 RPC만 service_role 전용으로 분리할지. 분리하면 service_role 키 관리와 Edge Function 내부 권한 확인이 새로 필요하다. 커스텀 DB 역할(예: OCR 저장 전용 역할)은 JWT `role` claim 발급이 따로 필요하므로, service_role 분리안과 비교해 이때 함께 정한다 |
